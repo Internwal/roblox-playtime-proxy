@@ -1,261 +1,177 @@
 /*
-	Connection Finder Proxy v2
-	
-	Finds shortest friend-chain between two Roblox players.
-	Bidirectional BFS, max 6 degrees.
-	
-	Deploy on Render.com (free tier).
+	Connection Finder Proxy — Chain Search
+	BFS through friend lists to find the chain connecting two players.
+	Every node in the chain gets proper name + avatar.
+	Deploy on Render.com.
 */
-
 const express = require("express");
 const app = express();
 app.use(express.json());
 
-// ─── Rate Limiting ───────────────────────────────────────
 const rateLimit = new Map();
-function checkRateLimit(ip) {
-	const now = Date.now();
-	const entry = rateLimit.get(ip);
-	if (!entry || now - entry.start > 60000) {
-		rateLimit.set(ip, { start: now, count: 1 });
-		return true;
-	}
-	entry.count++;
-	return entry.count <= 20;
+function rl(ip) {
+	const now = Date.now(), e = rateLimit.get(ip);
+	if (!e || now - e.s > 60000) { rateLimit.set(ip, { s: now, c: 1 }); return true; }
+	return ++e.c <= 25;
 }
 
-// ─── Roblox API helpers ──────────────────────────────────
-async function getFriends(userId) {
+async function getFriendIds(userId) {
 	try {
-		const resp = await fetch(
-			`https://friends.roblox.com/v1/users/${userId}/friends?limit=200`,
-			{ headers: { Accept: "application/json" } }
-		);
-		if (!resp.ok) return [];
-		const data = await resp.json();
-		return (data.data || []).map(f => f.id);
+		const r = await fetch(`https://friends.roblox.com/v1/users/${userId}/friends`,
+			{ headers: { Accept: "application/json" } });
+		if (!r.ok) return [];
+		const d = await r.json();
+		return (d.data || []).map(f => f.id);
 	} catch { return []; }
 }
 
-async function getUserInfo(userId) {
+async function getUsersBatch(ids) {
+	// POST to users API to get names in batch
+	if (!ids.length) return {};
+	const out = {};
 	try {
-		const resp = await fetch(
-			`https://users.roblox.com/v1/users/${userId}`,
-			{ headers: { Accept: "application/json" } }
-		);
-		if (!resp.ok) return { id: userId, name: "Unknown", displayName: "Unknown" };
-		const d = await resp.json();
-		return { id: d.id, name: d.name, displayName: d.displayName };
-	} catch { return { id: userId, name: "Unknown", displayName: "Unknown" }; }
+		const r = await fetch("https://users.roblox.com/v1/users", {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Accept: "application/json" },
+			body: JSON.stringify({ userIds: ids.slice(0, 100), excludeBannedUsers: false }),
+		});
+		const d = await r.json();
+		for (const u of (d.data || [])) out[u.id] = { id: u.id, name: u.name, displayName: u.displayName };
+	} catch {}
+	return out;
 }
 
-async function getAvatars(userIds) {
-	if (!userIds.length) return {};
+async function getAvatarsBatch(ids) {
+	if (!ids.length) return {};
+	const out = {};
 	try {
-		const resp = await fetch(
-			`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userIds.join(",")}&size=150x150&format=Png&isCircular=false`,
-			{ headers: { Accept: "application/json" } }
-		);
-		const data = await resp.json();
-		const m = {};
-		for (const e of (data.data || [])) m[e.targetId] = e.imageUrl;
-		return m;
-	} catch { return {}; }
+		const r = await fetch(
+			`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${ids.slice(0,100).join(",")}&size=150x150&format=Png&isCircular=false`,
+			{ headers: { Accept: "application/json" } });
+		const d = await r.json();
+		for (const e of (d.data || [])) out[e.targetId] = e.imageUrl;
+	} catch {}
+	return out;
 }
 
-// ─── Reconstruct path from BFS parent maps ──────────────
-function reconstructPath(meetingId, cameFromSideA, parentA, parentB) {
-	// Trace from meeting point back to A
-	const toA = [];
-	let cur = cameFromSideA; // the node on A's side that found meetingId
-	while (cur !== null) {
-		toA.unshift(cur);
-		cur = parentA.get(cur) ?? null;
-	}
-	// toA is now [userA, ..., cameFromSideA]
+app.get("/", (_, res) => res.json({ status: "ok" }));
+app.get("/ping", (_, res) => res.json({ pong: true }));
 
-	// Trace from meeting point back to B  
-	const toB = [];
-	cur = meetingId;
-	while (cur !== null) {
-		toB.push(cur);
-		cur = parentB.get(cur) ?? null;
-	}
-	// toB is now [meetingId, ..., userB]
-
-	return [...toA, ...toB];
-}
-
-// ─── Health ──────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status: "ok", service: "connection-finder-proxy" }));
-app.get("/ping", (req, res) => res.json({ pong: true }));
-
-// ─── Get friends ─────────────────────────────────────────
-app.get("/friends", async (req, res) => {
-	if (!checkRateLimit(req.ip)) return res.status(429).json({ error: "Rate limited" });
-	const { userId } = req.query;
-	if (!userId) return res.status(400).json({ error: "Missing userId" });
-	const friends = await getFriends(parseInt(userId));
-	res.json({ userId: parseInt(userId), friends, count: friends.length });
-});
-
-// ─── MAIN: Find connection ───────────────────────────────
-// GET /find-connection?userA=123&userB=456
-app.get("/find-connection", async (req, res) => {
-	if (!checkRateLimit(req.ip)) return res.status(429).json({ error: "Rate limited" });
+/*
+	GET /find-chain?userA=123&userB=456
+	Bidirectional BFS, max 6 degrees, 30 users expanded per layer.
+	Returns { found, degree, chain: [{id,name,displayName,avatar}] }
+*/
+app.get("/find-chain", async (req, res) => {
+	if (!rl(req.ip)) return res.status(429).json({ error: "Rate limited" });
 
 	const idA = parseInt(req.query.userA);
 	const idB = parseInt(req.query.userB);
-	if (!idA || !idB) return res.status(400).json({ error: "Missing userA or userB" });
+	if (!idA || !idB) return res.status(400).json({ error: "Need userA and userB" });
+	if (idA === idB) return res.json({ found: true, degree: 0, chain: [idA] });
 
-	// Same person
-	if (idA === idB) {
-		const info = await getUserInfo(idA);
-		const av = await getAvatars([idA]);
-		return res.json({
-			found: true, degree: 0,
-			path: [{ ...info, avatar: av[idA] || null }],
-			message: "Same person!",
-		});
-	}
-
-	console.log(`Searching connection: ${idA} <-> ${idB}`);
-	const startTime = Date.now();
+	console.log(`Chain search: ${idA} <-> ${idB}`);
+	const t0 = Date.now();
 
 	const MAX_DEGREE = 6;
-	const MAX_EXPAND = 40; // max users to expand per layer per side
+	const MAX_EXPAND = 30;
 
-	// parentA maps userId -> the userId that discovered it (from A's side)
-	// parentB maps userId -> the userId that discovered it (from B's side)
-	const parentA = new Map();
-	const parentB = new Map();
+	const parentA = new Map(); // userId -> parentId from A side
+	const parentB = new Map(); // userId -> parentId from B side
 	parentA.set(idA, null);
 	parentB.set(idB, null);
 
-	let frontierA = [idA];
-	let frontierB = [idB];
+	let frontA = [idA], frontB = [idB];
 
 	for (let step = 0; step < MAX_DEGREE; step++) {
-		// Pick the smaller frontier to expand
-		const expandingA = frontierA.length <= frontierB.length;
-		const frontier = expandingA ? frontierA : frontierB;
-		const ownParent = expandingA ? parentA : parentB;
-		const otherParent = expandingA ? parentB : parentA;
+		const useA = frontA.length <= frontB.length;
+		const front = useA ? frontA : frontB;
+		const own = useA ? parentA : parentB;
+		const other = useA ? parentB : parentA;
+		const expand = front.slice(0, MAX_EXPAND);
 
-		const toExpand = frontier.slice(0, MAX_EXPAND);
-		console.log(`  Step ${step + 1}: expanding ${toExpand.length} from ${expandingA ? "A" : "B"} side`);
+		console.log(`  Step ${step+1}: expanding ${expand.length} from ${useA?"A":"B"}`);
 
-		const nextFrontier = [];
+		const next = [];
 
-		// Fetch friends in parallel batches of 10
-		for (let i = 0; i < toExpand.length; i += 10) {
-			const batch = toExpand.slice(i, i + 10);
-			const results = await Promise.all(batch.map(uid => getFriends(uid)));
+		// Fetch in parallel batches of 8
+		for (let i = 0; i < expand.length; i += 8) {
+			const batch = expand.slice(i, i + 8);
+			const results = await Promise.all(batch.map(getFriendIds));
 
 			for (let j = 0; j < batch.length; j++) {
-				const expandedUser = batch[j];
-				const friends = results[j];
+				const uid = batch[j];
+				for (const fid of results[j]) {
+					if (other.has(fid)) {
+						// Found connection! Build chain.
+						console.log(`  Connected via ${fid} (${Date.now()-t0}ms)`);
 
-				for (const friendId of friends) {
-					// Check if this friend exists on the OTHER side → connection found
-					if (otherParent.has(friendId)) {
-						console.log(`  Connection found via ${friendId}! (${Date.now() - startTime}ms)`);
-
-						// Reconstruct the path
-						let pathIds;
-						if (expandingA) {
-							// expandedUser is on A's side, friendId is on B's side
-							// Trace A -> ... -> expandedUser
-							const toAPath = [];
-							let c = expandedUser;
-							while (c !== null) {
-								toAPath.unshift(c);
-								c = parentA.get(c) ?? null;
-							}
-							// Trace friendId -> ... -> B
-							const toBPath = [];
-							c = friendId;
-							while (c !== null) {
-								toBPath.push(c);
-								c = parentB.get(c) ?? null;
-							}
-							pathIds = [...toAPath, ...toBPath];
+						// Trace from A to fid
+						const halfA = [];
+						if (useA) {
+							// uid is A-side, fid is B-side
+							let c = uid; while (c !== null) { halfA.unshift(c); c = parentA.get(c) ?? null; }
+							halfA.push(fid);
+							const halfB = [];
+							c = parentB.get(fid) ?? null;
+							while (c !== null) { halfB.push(c); c = parentB.get(c) ?? null; }
+							var chainIds = [...halfA, ...halfB];
 						} else {
-							// expandedUser is on B's side, friendId is on A's side
-							// Trace A -> ... -> friendId
-							const toAPath = [];
-							let c = friendId;
-							while (c !== null) {
-								toAPath.unshift(c);
-								c = parentA.get(c) ?? null;
-							}
-							// Trace expandedUser -> ... -> B
-							const toBPath = [];
-							c = expandedUser;
-							while (c !== null) {
-								toBPath.push(c);
-								c = parentB.get(c) ?? null;
-							}
-							pathIds = [...toAPath, ...toBPath];
+							// uid is B-side, fid is A-side
+							let c = fid; while (c !== null) { halfA.unshift(c); c = parentA.get(c) ?? null; }
+							halfA.push(uid);
+							const halfB = [];
+							c = parentB.get(uid) ?? null;
+							while (c !== null) { halfB.push(c); c = parentB.get(c) ?? null; }
+							var chainIds = [...halfA, ...halfB];
 						}
 
-						// Get user info + avatars for the path
-						const infos = await Promise.all(pathIds.map(id => getUserInfo(id)));
-						const avatars = await getAvatars(pathIds);
-						const path = infos.map(u => ({
-							...u,
-							avatar: avatars[u.id] || null,
+						// Deduplicate consecutive
+						const clean = [chainIds[0]];
+						for (let k = 1; k < chainIds.length; k++) {
+							if (chainIds[k] !== chainIds[k-1]) clean.push(chainIds[k]);
+						}
+
+						// Resolve names + avatars for every person in chain
+						const [users, avatars] = await Promise.all([
+							getUsersBatch(clean),
+							getAvatarsBatch(clean),
+						]);
+
+						const chain = clean.map(id => ({
+							id,
+							name: users[id]?.name || `User${id}`,
+							displayName: users[id]?.displayName || `User${id}`,
+							avatar: avatars[id] || null,
 						}));
 
-						return res.json({
-							found: true,
-							degree: pathIds.length - 1,
-							path,
-						});
+						return res.json({ found: true, degree: clean.length - 1, chain });
 					}
 
-					// Not visited yet — add to frontier
-					if (!ownParent.has(friendId)) {
-						ownParent.set(friendId, expandedUser);
-						nextFrontier.push(friendId);
+					if (!own.has(fid)) {
+						own.set(fid, uid);
+						next.push(fid);
 					}
 				}
 			}
 		}
 
-		if (expandingA) {
-			frontierA = nextFrontier;
-		} else {
-			frontierB = nextFrontier;
-		}
-
-		if (nextFrontier.length === 0) break;
+		if (useA) frontA = next; else frontB = next;
+		if (!next.length) break;
 	}
 
-	// Not found
-	console.log(`  No connection found (${Date.now() - startTime}ms)`);
-	const [infoA, infoB] = await Promise.all([getUserInfo(idA), getUserInfo(idB)]);
-	const avatars = await getAvatars([idA, idB]);
-
-	res.json({
-		found: false, degree: -1, path: [],
-		userA: { ...infoA, avatar: avatars[idA] || null },
-		userB: { ...infoB, avatar: avatars[idB] || null },
-		message: `No connection found within ${MAX_DEGREE} degrees`,
-	});
+	console.log(`  No chain found (${Date.now()-t0}ms)`);
+	res.json({ found: false, degree: -1, chain: [] });
 });
 
-// ─── User info endpoint ──────────────────────────────────
+// User info endpoint
 app.get("/user-info", async (req, res) => {
-	if (!checkRateLimit(req.ip)) return res.status(429).json({ error: "Rate limited" });
-	const { userId } = req.query;
-	if (!userId) return res.status(400).json({ error: "Missing userId" });
-	const info = await getUserInfo(parseInt(userId));
-	const av = await getAvatars([parseInt(userId)]);
-	res.json({ ...info, avatar: av[parseInt(userId)] || null });
+	if (!rl(req.ip)) return res.status(429).json({ error: "Rate limited" });
+	const id = parseInt(req.query.userId);
+	if (!id) return res.status(400).json({ error: "Need userId" });
+	const u = await getUsersBatch([id]);
+	const a = await getAvatarsBatch([id]);
+	res.json({ id, name: u[id]?.name||"Unknown", displayName: u[id]?.displayName||"Unknown", avatar: a[id]||null });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-	console.log(`Connection Finder Proxy running on port ${PORT}`);
-});
+app.listen(process.env.PORT || 3000, "0.0.0.0", () => console.log("Connection Finder running"));
