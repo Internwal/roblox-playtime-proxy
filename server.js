@@ -1,15 +1,14 @@
 /*
-	Roblox API Proxy Server — v2
+	Connection Finder Proxy v2
 	
-	Fetches ALL badges a user has earned across EVERY game.
-	Groups them by game automatically. No hardcoded game list needed.
+	Finds shortest friend-chain between two Roblox players.
+	Bidirectional BFS, max 6 degrees.
 	
 	Deploy on Render.com (free tier).
 */
 
 const express = require("express");
 const app = express();
-
 app.use(express.json());
 
 // ─── Rate Limiting ───────────────────────────────────────
@@ -22,198 +21,241 @@ function checkRateLimit(ip) {
 		return true;
 	}
 	entry.count++;
-	return entry.count <= 30;
+	return entry.count <= 20;
+}
+
+// ─── Roblox API helpers ──────────────────────────────────
+async function getFriends(userId) {
+	try {
+		const resp = await fetch(
+			`https://friends.roblox.com/v1/users/${userId}/friends?limit=200`,
+			{ headers: { Accept: "application/json" } }
+		);
+		if (!resp.ok) return [];
+		const data = await resp.json();
+		return (data.data || []).map(f => f.id);
+	} catch { return []; }
+}
+
+async function getUserInfo(userId) {
+	try {
+		const resp = await fetch(
+			`https://users.roblox.com/v1/users/${userId}`,
+			{ headers: { Accept: "application/json" } }
+		);
+		if (!resp.ok) return { id: userId, name: "Unknown", displayName: "Unknown" };
+		const d = await resp.json();
+		return { id: d.id, name: d.name, displayName: d.displayName };
+	} catch { return { id: userId, name: "Unknown", displayName: "Unknown" }; }
+}
+
+async function getAvatars(userIds) {
+	if (!userIds.length) return {};
+	try {
+		const resp = await fetch(
+			`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userIds.join(",")}&size=150x150&format=Png&isCircular=false`,
+			{ headers: { Accept: "application/json" } }
+		);
+		const data = await resp.json();
+		const m = {};
+		for (const e of (data.data || [])) m[e.targetId] = e.imageUrl;
+		return m;
+	} catch { return {}; }
+}
+
+// ─── Reconstruct path from BFS parent maps ──────────────
+function reconstructPath(meetingId, cameFromSideA, parentA, parentB) {
+	// Trace from meeting point back to A
+	const toA = [];
+	let cur = cameFromSideA; // the node on A's side that found meetingId
+	while (cur !== null) {
+		toA.unshift(cur);
+		cur = parentA.get(cur) ?? null;
+	}
+	// toA is now [userA, ..., cameFromSideA]
+
+	// Trace from meeting point back to B  
+	const toB = [];
+	cur = meetingId;
+	while (cur !== null) {
+		toB.push(cur);
+		cur = parentB.get(cur) ?? null;
+	}
+	// toB is now [meetingId, ..., userB]
+
+	return [...toA, ...toB];
 }
 
 // ─── Health ──────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status: "ok", service: "roblox-playtime-proxy-v2" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "connection-finder-proxy" }));
 app.get("/ping", (req, res) => res.json({ pong: true }));
 
-// ─── MAIN ENDPOINT: Get ALL badges for a user ───────────
-// GET /all-badges?userId=12345
-app.get("/all-badges", async (req, res) => {
-	if (!checkRateLimit(req.ip)) {
-		return res.status(429).json({ error: "Rate limited" });
-	}
-
+// ─── Get friends ─────────────────────────────────────────
+app.get("/friends", async (req, res) => {
+	if (!checkRateLimit(req.ip)) return res.status(429).json({ error: "Rate limited" });
 	const { userId } = req.query;
-	if (!userId) {
-		return res.status(400).json({ error: "Missing userId" });
-	}
-
-	try {
-		// Paginate through ALL user badges
-		let allBadges = [];
-		let cursor = "";
-		let pages = 0;
-		const MAX_PAGES = 20; // up to 2000 badges
-
-		while (pages < MAX_PAGES) {
-			const url = `https://badges.roblox.com/v1/users/${userId}/badges?limit=100&sortOrder=Asc${cursor ? "&cursor=" + cursor : ""}`;
-			const resp = await fetch(url, { headers: { "Accept": "application/json" } });
-			const data = await resp.json();
-
-			if (data.data) {
-				allBadges = allBadges.concat(data.data);
-			}
-
-			if (data.nextPageCursor) {
-				cursor = data.nextPageCursor;
-				pages++;
-			} else {
-				break;
-			}
-		}
-
-		// Group badges by awarding universe (game)
-		const gameMap = new Map();
-
-		for (const badge of allBadges) {
-			// Try every possible field for universe ID
-			const universe = badge.awarder?.id || badge.awardingUniverse?.id || null;
-
-			if (!universe) continue;
-
-			if (!gameMap.has(universe)) {
-				gameMap.set(universe, {
-					universeId: universe,
-					name: null, // Will resolve below
-					badges: [],
-				});
-			}
-
-			gameMap.get(universe).badges.push({
-				id: badge.id,
-				name: badge.name,
-				rarityPct: badge.statistics?.winRatePercentage ?? badge.statistics?.pastDayAwardedCount ?? null,
-				awardedCount: badge.statistics?.awardedCount || 0,
-			});
-		}
-
-		// Resolve game names via games API (batch by 50)
-		const universeIds = Array.from(gameMap.keys());
-		let resolved = 0;
-		for (let i = 0; i < universeIds.length; i += 50) {
-			const batch = universeIds.slice(i, i + 50);
-			try {
-				const gamesUrl = `https://games.roblox.com/v1/games?universeIds=${batch.join(",")}`;
-				const gamesResp = await fetch(gamesUrl, { headers: { "Accept": "application/json" } });
-				const gamesData = await gamesResp.json();
-				if (gamesData.data) {
-					for (const game of gamesData.data) {
-						if (gameMap.has(game.id)) {
-							gameMap.get(game.id).name = game.name;
-							resolved++;
-						}
-					}
-				}
-			} catch (e) {
-				console.error(`Failed to resolve game names for batch starting at ${i}:`, e.message);
-			}
-		}
-		console.log(`Resolved ${resolved}/${universeIds.length} game names`);
-
-		// Fill in any still-missing names
-		for (const [id, data] of gameMap) {
-			if (!data.name) data.name = `Game ${id}`;
-		}
-
-		// Get awarded dates for timing info
-		const allBadgeIds = allBadges.map(b => b.id);
-		const awardedDates = new Map();
-
-		for (let i = 0; i < allBadgeIds.length; i += 100) {
-			const batch = allBadgeIds.slice(i, i + 100);
-			try {
-				const dateUrl = `https://badges.roblox.com/v1/users/${userId}/badges/awarded-dates?badgeIds=${batch.join(",")}`;
-				const dateResp = await fetch(dateUrl, { headers: { "Accept": "application/json" } });
-				const dateData = await dateResp.json();
-				if (dateData.data) {
-					for (const entry of dateData.data) {
-						awardedDates.set(entry.badgeId, entry.awardedDate);
-					}
-				}
-			} catch (e) { /* skip batch on error */ }
-		}
-
-		// Build final result per game
-		const games = [];
-
-		for (const [universeId, gameData] of gameMap) {
-			let firstEarned = null;
-			let lastEarned = null;
-
-			const enrichedBadges = gameData.badges.map(badge => {
-				const earnedDate = awardedDates.get(badge.id) || null;
-				if (earnedDate) {
-					const d = new Date(earnedDate);
-					if (!firstEarned || d < new Date(firstEarned)) firstEarned = earnedDate;
-					if (!lastEarned || d > new Date(lastEarned)) lastEarned = earnedDate;
-				}
-				return { ...badge, earnedDate };
-			});
-
-			games.push({
-				universeId,
-				name: gameData.name,
-				earnedCount: enrichedBadges.length,
-				earnedBadges: enrichedBadges,
-				firstEarned,
-				lastEarned,
-			});
-		}
-
-		// Sort by badge count descending
-		games.sort((a, b) => b.earnedCount - a.earnedCount);
-
-		res.json({
-			userId: parseInt(userId),
-			totalBadges: allBadges.length,
-			totalGames: games.length,
-			games,
-		});
-	} catch (err) {
-		console.error("Error fetching badges:", err);
-		res.status(500).json({ error: "Failed to fetch badges", details: err.message });
-	}
+	if (!userId) return res.status(400).json({ error: "Missing userId" });
+	const friends = await getFriends(parseInt(userId));
+	res.json({ userId: parseInt(userId), friends, count: friends.length });
 });
 
-// ─── Game Info (names, icons) ────────────────────────────
-app.get("/game-info", async (req, res) => {
-	if (!checkRateLimit(req.ip)) {
-		return res.status(429).json({ error: "Rate limited" });
+// ─── MAIN: Find connection ───────────────────────────────
+// GET /find-connection?userA=123&userB=456
+app.get("/find-connection", async (req, res) => {
+	if (!checkRateLimit(req.ip)) return res.status(429).json({ error: "Rate limited" });
+
+	const idA = parseInt(req.query.userA);
+	const idB = parseInt(req.query.userB);
+	if (!idA || !idB) return res.status(400).json({ error: "Missing userA or userB" });
+
+	// Same person
+	if (idA === idB) {
+		const info = await getUserInfo(idA);
+		const av = await getAvatars([idA]);
+		return res.json({
+			found: true, degree: 0,
+			path: [{ ...info, avatar: av[idA] || null }],
+			message: "Same person!",
+		});
 	}
 
-	const { universeIds } = req.query;
-	if (!universeIds) {
-		return res.status(400).json({ error: "Missing universeIds" });
+	console.log(`Searching connection: ${idA} <-> ${idB}`);
+	const startTime = Date.now();
+
+	const MAX_DEGREE = 6;
+	const MAX_EXPAND = 40; // max users to expand per layer per side
+
+	// parentA maps userId -> the userId that discovered it (from A's side)
+	// parentB maps userId -> the userId that discovered it (from B's side)
+	const parentA = new Map();
+	const parentB = new Map();
+	parentA.set(idA, null);
+	parentB.set(idB, null);
+
+	let frontierA = [idA];
+	let frontierB = [idB];
+
+	for (let step = 0; step < MAX_DEGREE; step++) {
+		// Pick the smaller frontier to expand
+		const expandingA = frontierA.length <= frontierB.length;
+		const frontier = expandingA ? frontierA : frontierB;
+		const ownParent = expandingA ? parentA : parentB;
+		const otherParent = expandingA ? parentB : parentA;
+
+		const toExpand = frontier.slice(0, MAX_EXPAND);
+		console.log(`  Step ${step + 1}: expanding ${toExpand.length} from ${expandingA ? "A" : "B"} side`);
+
+		const nextFrontier = [];
+
+		// Fetch friends in parallel batches of 10
+		for (let i = 0; i < toExpand.length; i += 10) {
+			const batch = toExpand.slice(i, i + 10);
+			const results = await Promise.all(batch.map(uid => getFriends(uid)));
+
+			for (let j = 0; j < batch.length; j++) {
+				const expandedUser = batch[j];
+				const friends = results[j];
+
+				for (const friendId of friends) {
+					// Check if this friend exists on the OTHER side → connection found
+					if (otherParent.has(friendId)) {
+						console.log(`  Connection found via ${friendId}! (${Date.now() - startTime}ms)`);
+
+						// Reconstruct the path
+						let pathIds;
+						if (expandingA) {
+							// expandedUser is on A's side, friendId is on B's side
+							// Trace A -> ... -> expandedUser
+							const toAPath = [];
+							let c = expandedUser;
+							while (c !== null) {
+								toAPath.unshift(c);
+								c = parentA.get(c) ?? null;
+							}
+							// Trace friendId -> ... -> B
+							const toBPath = [];
+							c = friendId;
+							while (c !== null) {
+								toBPath.push(c);
+								c = parentB.get(c) ?? null;
+							}
+							pathIds = [...toAPath, ...toBPath];
+						} else {
+							// expandedUser is on B's side, friendId is on A's side
+							// Trace A -> ... -> friendId
+							const toAPath = [];
+							let c = friendId;
+							while (c !== null) {
+								toAPath.unshift(c);
+								c = parentA.get(c) ?? null;
+							}
+							// Trace expandedUser -> ... -> B
+							const toBPath = [];
+							c = expandedUser;
+							while (c !== null) {
+								toBPath.push(c);
+								c = parentB.get(c) ?? null;
+							}
+							pathIds = [...toAPath, ...toBPath];
+						}
+
+						// Get user info + avatars for the path
+						const infos = await Promise.all(pathIds.map(id => getUserInfo(id)));
+						const avatars = await getAvatars(pathIds);
+						const path = infos.map(u => ({
+							...u,
+							avatar: avatars[u.id] || null,
+						}));
+
+						return res.json({
+							found: true,
+							degree: pathIds.length - 1,
+							path,
+						});
+					}
+
+					// Not visited yet — add to frontier
+					if (!ownParent.has(friendId)) {
+						ownParent.set(friendId, expandedUser);
+						nextFrontier.push(friendId);
+					}
+				}
+			}
+		}
+
+		if (expandingA) {
+			frontierA = nextFrontier;
+		} else {
+			frontierB = nextFrontier;
+		}
+
+		if (nextFrontier.length === 0) break;
 	}
 
-	try {
-		const infoUrl = `https://games.roblox.com/v1/games?universeIds=${universeIds}`;
-		const infoRes = await fetch(infoUrl, { headers: { "Accept": "application/json" } });
-		const infoData = await infoRes.json();
+	// Not found
+	console.log(`  No connection found (${Date.now() - startTime}ms)`);
+	const [infoA, infoB] = await Promise.all([getUserInfo(idA), getUserInfo(idB)]);
+	const avatars = await getAvatars([idA, idB]);
 
-		const thumbUrl = `https://thumbnails.roblox.com/v1/games/icons?universeIds=${universeIds}&returnPolicy=PlaceHolder&size=128x128&format=Png&isCircular=false`;
-		const thumbRes = await fetch(thumbUrl, { headers: { "Accept": "application/json" } });
-		const thumbData = await thumbRes.json();
-		const thumbMap = new Map((thumbData.data || []).map(t => [t.targetId, t.imageUrl]));
+	res.json({
+		found: false, degree: -1, path: [],
+		userA: { ...infoA, avatar: avatars[idA] || null },
+		userB: { ...infoB, avatar: avatars[idB] || null },
+		message: `No connection found within ${MAX_DEGREE} degrees`,
+	});
+});
 
-		const games = (infoData.data || []).map(g => ({
-			universeId: g.id,
-			name: g.name,
-			playing: g.playing,
-			visits: g.visits,
-			icon: thumbMap.get(g.id) || null,
-		}));
-
-		res.json({ games });
-	} catch (err) {
-		res.status(500).json({ error: "Failed to fetch game info", details: err.message });
-	}
+// ─── User info endpoint ──────────────────────────────────
+app.get("/user-info", async (req, res) => {
+	if (!checkRateLimit(req.ip)) return res.status(429).json({ error: "Rate limited" });
+	const { userId } = req.query;
+	if (!userId) return res.status(400).json({ error: "Missing userId" });
+	const info = await getUserInfo(parseInt(userId));
+	const av = await getAvatars([parseInt(userId)]);
+	res.json({ ...info, avatar: av[parseInt(userId)] || null });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
-	console.log(`Roblox Proxy v2 running on port ${PORT}`);
+	console.log(`Connection Finder Proxy running on port ${PORT}`);
 });
