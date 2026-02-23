@@ -92,6 +92,7 @@ app.get("/all-badges", async (req, res) => {
 
 		// Resolve game names via games API (batch by 50)
 		const universeIds = Array.from(gameMap.keys());
+		let resolved = 0;
 		for (let i = 0; i < universeIds.length; i += 50) {
 			const batch = universeIds.slice(i, i + 50);
 			try {
@@ -102,11 +103,15 @@ app.get("/all-badges", async (req, res) => {
 					for (const game of gamesData.data) {
 						if (gameMap.has(game.id)) {
 							gameMap.get(game.id).name = game.name;
+							resolved++;
 						}
 					}
 				}
-			} catch (e) { /* skip batch */ }
+			} catch (e) {
+				console.error(`Failed to resolve game names for batch starting at ${i}:`, e.message);
+			}
 		}
+		console.log(`Resolved ${resolved}/${universeIds.length} game names`);
 
 		// Fill in any still-missing names
 		for (const [id, data] of gameMap) {
