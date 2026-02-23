@@ -69,15 +69,15 @@ app.get("/all-badges", async (req, res) => {
 		const gameMap = new Map();
 
 		for (const badge of allBadges) {
-			const universe = badge.awarder?.id || badge.awardingUniverse?.id;
-			const universeName = badge.awarder?.name || badge.awardingUniverse?.name || "Unknown Game";
+			// Try every possible field for universe ID
+			const universe = badge.awarder?.id || badge.awardingUniverse?.id || null;
 
 			if (!universe) continue;
 
 			if (!gameMap.has(universe)) {
 				gameMap.set(universe, {
 					universeId: universe,
-					name: universeName,
+					name: null, // Will resolve below
 					badges: [],
 				});
 			}
@@ -85,9 +85,32 @@ app.get("/all-badges", async (req, res) => {
 			gameMap.get(universe).badges.push({
 				id: badge.id,
 				name: badge.name,
-				rarityPct: badge.statistics?.winRatePercentage ?? null,
+				rarityPct: badge.statistics?.winRatePercentage ?? badge.statistics?.pastDayAwardedCount ?? null,
 				awardedCount: badge.statistics?.awardedCount || 0,
 			});
+		}
+
+		// Resolve game names via games API (batch by 50)
+		const universeIds = Array.from(gameMap.keys());
+		for (let i = 0; i < universeIds.length; i += 50) {
+			const batch = universeIds.slice(i, i + 50);
+			try {
+				const gamesUrl = `https://games.roblox.com/v1/games?universeIds=${batch.join(",")}`;
+				const gamesResp = await fetch(gamesUrl, { headers: { "Accept": "application/json" } });
+				const gamesData = await gamesResp.json();
+				if (gamesData.data) {
+					for (const game of gamesData.data) {
+						if (gameMap.has(game.id)) {
+							gameMap.get(game.id).name = game.name;
+						}
+					}
+				}
+			} catch (e) { /* skip batch */ }
+		}
+
+		// Fill in any still-missing names
+		for (const [id, data] of gameMap) {
+			if (!data.name) data.name = `Game ${id}`;
 		}
 
 		// Get awarded dates for timing info
